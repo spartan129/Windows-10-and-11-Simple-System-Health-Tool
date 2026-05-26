@@ -6,21 +6,18 @@ A lightweight, GUI-based Windows maintenance utility built entirely in PowerShel
 
 ## Download
 
-Download both files and place them in the **same folder**:
+Download the single file below — no installation required:
 
 | File | Description |
 |---|---|
-| [`Launch_Health_Tool.vbs`](Launch_Health_Tool.vbs) | Double-click launcher — opens the tool with no console window |
-| [`Simple_System_Health_Tool_GUI.ps1`](Simple_System_Health_Tool_GUI.ps1) | The main PowerShell script |
-
-> **Both files must be in the same folder for the launcher to work.**
+| [`Launch_Health_Tool.vbs`](Launch_Health_Tool.vbs) | Double-click to run — everything is self-contained |
 
 ---
 
 ## How to Run
 
-1. Download both files into the same folder.
-2. Double-click **`Launch_Health_Tool.vbs`**.
+1. Download **`Launch_Health_Tool.vbs`**.
+2. Double-click it from anywhere — no specific folder required.
 3. When prompted by Windows UAC, click **Yes** to allow Administrator access (required for system repairs).
 4. The GUI will open and you're ready to go.
 
@@ -45,7 +42,7 @@ The tool provides a clean dark-themed GUI with six maintenance operations, each 
 
 ### Report File
 
-Every operation is automatically logged to a `.txt` report file saved in the same folder as the script, named after your computer (e.g. `DESKTOPSystemHealth.txt`). The report includes your computer name, Windows version, build number, serial number, and a timestamped log of every step's result and exit code.
+Every operation is automatically logged to a `.txt` report file saved in the same folder as the `.vbs` file, named after your computer (e.g. `DESKTOPSystemHealth.txt`). The report includes your computer name, Windows version, build number, serial number, and a timestamped log of every step's result and exit code.
 
 Click **Open Report File** in the GUI at any time to view it in Notepad.
 
