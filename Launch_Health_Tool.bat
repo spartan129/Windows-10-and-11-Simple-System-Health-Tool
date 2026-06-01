@@ -63,11 +63,12 @@ $ReportPath = Join-Path $ScriptDir "$($env:COMPUTERNAME)SystemHealth.txt"
 #   H=header (cyan)  P=pass (green)  F=fail (red)  E=error (red)
 #   D=detail (dim)   I=info (white)
 # ==============================================================================
-$script:MsgQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
-$script:IsBusy   = $false
-$script:PSInst   = $null
-$script:RS       = $null
-$script:Handle   = $null
+$script:MsgQueue     = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+$script:IsBusy       = $false
+$script:PSInst       = $null
+$script:RS           = $null
+$script:Handle       = $null
+$script:HadStepError = $false
 
 # ==============================================================================
 # REPORT  (called on UI thread only)
@@ -118,7 +119,21 @@ function Write-Result([string]$Result, [int]$Code, [string]$Msg) {
         "Result    : $Result`nExit Code : $Code`nMessage   : $Msg`n",
         [Text.Encoding]::UTF8)
 }
-function Invoke-Step([string]$Title, [string]$CmdLine) {
+# Progress-line patterns to suppress from the log display
+$ProgressPatterns = @(
+    '^\[=+',                    # DISM progress bars  [====  45.3%  ====]
+    '^Progress:',               # CHKDSK progress     Progress: 123 of 456...
+    '^\s*$'                     # blank lines
+)
+
+function Is-ProgressLine([string]$line) {
+    foreach ($pat in $ProgressPatterns) {
+        if ($line -match $pat) { return $true }
+    }
+    return $false
+}
+
+function Invoke-Step([string]$Title, [string]$CmdLine, [int[]]$OkCodes = @(0)) {
     Write-Section $Title
     $Queue.Enqueue("I|  $Title")
     try {
@@ -138,22 +153,30 @@ function Invoke-Step([string]$Title, [string]$CmdLine) {
 
         $combined = ($out + $err).Trim()
         foreach ($ln in ($combined -split "`r?`n")) {
-            if ($ln.Trim()) { $Queue.Enqueue("D|    $ln") }
+            if ($ln.Trim() -and -not (Is-ProgressLine $ln)) {
+                $Queue.Enqueue("D|    $ln")
+            }
         }
         $last = ($combined -split "`r?`n" |
                  Where-Object { $_.Trim() } | Select-Object -Last 1)
         if (-not $last) { $last = "(no output)" }
 
-        $res = if ($rc -eq 0) { "PASS" } else { "FAIL" }
+        $pass = $OkCodes -contains $rc
+        $res  = if ($pass) { "PASS" } else { "FAIL" }
         Write-Result $res $rc $last
-        if ($rc -eq 0) { $Queue.Enqueue("P|    [PASS] Exit code: $rc") }
-        else           { $Queue.Enqueue("F|    [FAIL] Exit code: $rc") }
+        if ($pass) { $Queue.Enqueue("P|    [PASS] Exit code: $rc") }
+        else       { $Queue.Enqueue("F|    [FAIL] Exit code: $rc") }
         $Queue.Enqueue("I|")
     } catch {
         Write-Result "FAIL" -1 $_.Exception.Message
         $Queue.Enqueue("E|    [ERROR] $($_.Exception.Message)")
         $Queue.Enqueue("I|")
     }
+}
+
+# Runs a single service command and ignores "already stopped/started" exit codes
+function Invoke-ServiceStep([string]$Title, [string]$CmdLine) {
+    Invoke-Step $Title $CmdLine -OkCodes @(0, 2)
 }
 
 switch ($TaskName) {
@@ -169,27 +192,66 @@ switch ($TaskName) {
     }
     "NetworkReset" {
         $Queue.Enqueue("H|-- Reset Network -----------------------------------------------------------")
-        Invoke-Step "Disable Physical Adapters" 'wmic path win32_networkadapter where "NetEnabled=true and PhysicalAdapter=true" call disable'
-        Invoke-Step "Enable Physical Adapters"  'wmic path win32_networkadapter where "PhysicalAdapter=true" call enable'
-        Invoke-Step "Release and Renew IP"       "ipconfig /release & ipconfig /renew"
-        Invoke-Step "Flush DNS Cache"            "ipconfig /flushdns"
-        Invoke-Step "Reset Winsock Catalog"      "netsh winsock reset"
-        Invoke-Step "Reset TCP/IP Stack"         "netsh int ip reset"
+
+        # Disable/enable physical adapters using PowerShell (wmic removed in Win11 24H2+)
+        try {
+            $Queue.Enqueue("I|  Disable Physical Adapters")
+            $adapters = Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' }
+            foreach ($a in $adapters) {
+                Disable-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop
+                $Queue.Enqueue("D|    Disabled: $($a.Name)")
+            }
+            $Queue.Enqueue("P|    [PASS] Adapters disabled")
+            $Queue.Enqueue("I|")
+        } catch {
+            $Queue.Enqueue("E|    [ERROR] $($_.Exception.Message)")
+            $Queue.Enqueue("I|")
+        }
+
+        Start-Sleep -Seconds 2
+
+        try {
+            $Queue.Enqueue("I|  Enable Physical Adapters")
+            $adapters = Get-NetAdapter -Physical
+            foreach ($a in $adapters) {
+                Enable-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop
+                $Queue.Enqueue("D|    Enabled: $($a.Name)")
+            }
+            $Queue.Enqueue("P|    [PASS] Adapters enabled")
+            $Queue.Enqueue("I|")
+        } catch {
+            $Queue.Enqueue("E|    [ERROR] $($_.Exception.Message)")
+            $Queue.Enqueue("I|")
+        }
+
+        Start-Sleep -Seconds 3
+
+        Invoke-Step "Release and Renew IP"  "ipconfig /release & ipconfig /renew"
+        Invoke-Step "Flush DNS Cache"       "ipconfig /flushdns"
+        Invoke-Step "Reset Winsock Catalog" "netsh winsock reset"
+        # netsh int ip reset exits 1 on some items even on success - treat 0 and 1 as pass
+        Invoke-Step "Reset TCP/IP Stack"    "netsh int ip reset" -OkCodes @(0, 1)
     }
     "SystemCheck" {
         $Queue.Enqueue("H|-- System Check ------------------------------------------------------------")
         $Queue.Enqueue("I|  Note: DISM RestoreHealth may take 10-20 minutes.")
         Invoke-Step "DISM RestoreHealth" "DISM /Online /Cleanup-Image /RestoreHealth"
         Invoke-Step "SFC Scan"           "sfc /scannow"
-        Invoke-Step "CHKDSK C: Scan"    "chkdsk C: /scan"
+        Invoke-Step "CHKDSK C: Scan"     "chkdsk C: /scan"
     }
     "WindowsUpdate" {
         $Queue.Enqueue("H|-- Reset Windows Update -----------------------------------------------------")
-        $cmd = "net stop wuauserv & net stop bits & net stop cryptsvc & net stop msiserver & " +
-               "ren C:\Windows\SoftwareDistribution SoftwareDistribution.old 2>nul & " +
-               "ren C:\Windows\System32\catroot2 catroot2.old 2>nul & " +
-               "net start msiserver & net start cryptsvc & net start bits & net start wuauserv"
-        Invoke-Step "Reset Windows Update" $cmd
+        # Split into individual steps so nothing hangs waiting on a prior command
+        Invoke-ServiceStep "Stop Windows Update"    "net stop wuauserv"
+        Invoke-ServiceStep "Stop BITS"              "net stop bits"
+        Invoke-ServiceStep "Stop Cryptographic Svc" "net stop cryptsvc"
+        Invoke-ServiceStep "Stop MSI Installer"     "net stop msiserver"
+        Invoke-Step "Clear SoftwareDistribution" "if exist C:\Windows\SoftwareDistribution (ren C:\Windows\SoftwareDistribution SoftwareDistribution.old)" -OkCodes @(0,1)
+        Invoke-Step "Clear catroot2"             "if exist C:\Windows\System32\catroot2 (ren C:\Windows\System32\catroot2 catroot2.old)" -OkCodes @(0,1)
+        Invoke-ServiceStep "Start MSI Installer"     "net start msiserver"
+        Invoke-ServiceStep "Start Cryptographic Svc" "net start cryptsvc"
+        Invoke-ServiceStep "Start BITS"              "net start bits"
+        Invoke-ServiceStep "Start Windows Update"    "net start wuauserv"
     }
     "MemoryDiag" {
         $Queue.Enqueue("H|-- Windows Memory Diagnostic -----------------------------------------------")
@@ -219,13 +281,18 @@ switch ($TaskName) {
         Invoke-Step "DISM ScanHealth"    "DISM /Online /Cleanup-Image /ScanHealth"
         Invoke-Step "DISM RestoreHealth" "DISM /Online /Cleanup-Image /RestoreHealth"
         Invoke-Step "SFC Scan"           "sfc /scannow"
-        Invoke-Step "CHKDSK C: Scan"    "chkdsk C: /scan"
+        Invoke-Step "CHKDSK C: Scan"     "chkdsk C: /scan"
         Invoke-Step "Component Cleanup"  "DISM /Online /Cleanup-Image /StartComponentCleanup"
-        $upd = "net stop wuauserv & net stop bits & net stop cryptsvc & net stop msiserver & " +
-               "ren C:\Windows\SoftwareDistribution SoftwareDistribution.old 2>nul & " +
-               "ren C:\Windows\System32\catroot2 catroot2.old 2>nul & " +
-               "net start msiserver & net start cryptsvc & net start bits & net start wuauserv"
-        Invoke-Step "Reset Windows Update" $upd
+        Invoke-ServiceStep "Stop Windows Update"    "net stop wuauserv"
+        Invoke-ServiceStep "Stop BITS"              "net stop bits"
+        Invoke-ServiceStep "Stop Cryptographic Svc" "net stop cryptsvc"
+        Invoke-ServiceStep "Stop MSI Installer"     "net stop msiserver"
+        Invoke-Step "Clear SoftwareDistribution" "if exist C:\Windows\SoftwareDistribution (ren C:\Windows\SoftwareDistribution SoftwareDistribution.old)" -OkCodes @(0,1)
+        Invoke-Step "Clear catroot2"             "if exist C:\Windows\System32\catroot2 (ren C:\Windows\System32\catroot2 catroot2.old)" -OkCodes @(0,1)
+        Invoke-ServiceStep "Start MSI Installer"     "net start msiserver"
+        Invoke-ServiceStep "Start Cryptographic Svc" "net start cryptsvc"
+        Invoke-ServiceStep "Start BITS"              "net start bits"
+        Invoke-ServiceStep "Start Windows Update"    "net start wuauserv"
         Invoke-Step "Stop Print Spooler"  "net stop spooler"
         $q = "$env:SystemRoot\System32\spool\PRINTERS"
         if (Test-Path $q) {
@@ -235,7 +302,7 @@ switch ($TaskName) {
         Invoke-Step "Start Print Spooler" "net start spooler"
         Invoke-Step "Flush DNS"           "ipconfig /flushdns"
         Invoke-Step "Reset Winsock"       "netsh winsock reset"
-        Invoke-Step "Reset TCP/IP"        "netsh int ip reset"
+        Invoke-Step "Reset TCP/IP"        "netsh int ip reset" -OkCodes @(0, 1)
     }
 }
 '@
@@ -252,7 +319,8 @@ function Start-Task([string]$TaskName) {
     }
     Initialize-Report
 
-    $script:IsBusy    = $true
+    $script:HadStepError = $false
+    $script:IsBusy       = $true
     $statusLabel.Text = "Running: $TaskName ..."
     foreach ($b in $script:AllButtons) { $b.Enabled = $false }
 
@@ -520,7 +588,8 @@ function Append-Log([string]$Text, [Drawing.Color]$Color) {
 
 function Show-QueuedMessage([string]$Msg) {
     if ($Msg.Length -ge 2 -and $Msg[1] -eq '|') {
-        $col = switch ($Msg[0]) {
+        $type = $Msg[0]
+        $col = switch ($type) {
             'H' { $cCyan  }
             'P' { $cGreen }
             'F' { $cRed   }
@@ -528,6 +597,8 @@ function Show-QueuedMessage([string]$Msg) {
             'D' { $cDim   }
             default { $cFG }
         }
+        # Track actual step failures - F and E messages only
+        if ($type -eq 'F' -or $type -eq 'E') { $script:HadStepError = $true }
         Append-Log $Msg.Substring(2) $col
     } else {
         Append-Log $Msg $cFG
@@ -547,7 +618,7 @@ $pollingTimer.Add_Tick({
         # Drain any remaining messages
         while ($script:MsgQueue.TryDequeue([ref]$msg)) { Show-QueuedMessage $msg }
 
-        if ($script:PSInst.HadErrors) {
+        if ($script:HadStepError) {
             Append-Log "" $cFG
             Append-Log "[!] One or more steps reported errors - see report for details." $cRed
         } else {
@@ -560,10 +631,11 @@ $pollingTimer.Add_Tick({
         # Cleanup
         try { $script:PSInst.Dispose()                          } catch {}
         try { $script:RS.Close(); $script:RS.Dispose()          } catch {}
-        $script:PSInst  = $null
-        $script:RS      = $null
-        $script:Handle  = $null
-        $script:IsBusy  = $false
+        $script:PSInst       = $null
+        $script:RS           = $null
+        $script:Handle       = $null
+        $script:IsBusy       = $false
+        $script:HadStepError = $false
 
         $statusLabel.Text = "Ready"
         foreach ($b in $script:AllButtons) { $b.Enabled = $true }
