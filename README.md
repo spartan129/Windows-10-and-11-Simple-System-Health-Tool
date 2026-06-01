@@ -10,13 +10,13 @@ Download the single file below — no installation required:
 
 | File | Description |
 |---|---|
-| [`Launch_Health_Tool.vbs`](Launch_Health_Tool.vbs) | Double-click to run — everything is self-contained |
+| [`Launch_Health_Tool.bat`](Launch_Health_Tool.bat) | Double-click to run — everything is self-contained |
 
 ---
 
 ## How to Run
 
-1. Download **`Launch_Health_Tool.vbs`**.
+1. Download **`Launch_Health_Tool.bat`**.
 2. Double-click it from anywhere — no specific folder required.
 3. When prompted by Windows UAC, click **Yes** to allow Administrator access (required for system repairs).
 4. The GUI will open and you're ready to go.
